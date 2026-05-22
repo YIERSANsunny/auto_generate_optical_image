@@ -49,13 +49,13 @@ class DPMZMParams:
     voltage_i: float = 0.0
     voltage_q: float = 0.0
     voltage_p: float = 0.0
-    vpi_i: float = 4.0
-    vpi_q: float = 4.0
-    vpi_p: float = 4.0
+    vpi_i: float = 5.0
+    vpi_q: float = 5.0
+    vpi_p: float = 5.0
     rf_frequency_ghz: float = 10.0
     rf_amplitude_i_v: float = 0.4
     rf_amplitude_q_v: float = 0.4
-    q_rf_phase_deg: float = 90.0
+    q_rf_phase_deg: float = 0.0
     sideband_order: int = 5
 
 

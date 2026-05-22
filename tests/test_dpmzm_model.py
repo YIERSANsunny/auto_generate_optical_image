@@ -29,7 +29,9 @@ from app import (
     ARROW_BASE_LENGTH_PX,
     arrow_display_delta_px,
     is_visible_sideband,
+    phase_deg_to_voltage,
     vector_arrow_length_px,
+    voltage_to_phase_deg,
 )
 
 
@@ -187,8 +189,11 @@ class DPMZMModelTests(unittest.TestCase):
                 self.assertAlmostEqual(actual.imag, expected.imag, places=12)
 
     def test_p_bias_shift_by_one_vpi_rotates_q_after_p_by_180_degrees(self) -> None:
-        base = simulate_spectra(DPMZMParams(sideband_order=4))
-        shifted = simulate_spectra(DPMZMParams(voltage_p=4.0, sideband_order=4))
+        params = DPMZMParams(sideband_order=4)
+        base = simulate_spectra(params)
+        shifted = simulate_spectra(
+            DPMZMParams(voltage_p=params.vpi_p, vpi_p=params.vpi_p, sideband_order=4)
+        )
 
         base_by_order = {line.order: line for line in base[VIEW_Q_AFTER_P]}
         shifted_by_order = {line.order: line for line in shifted[VIEW_Q_AFTER_P]}
@@ -255,6 +260,62 @@ class DPMZMModelTests(unittest.TestCase):
                 0.0,
                 places=12,
             )
+
+    def test_bias_voltage_phase_conversion_helpers(self) -> None:
+        self.assertAlmostEqual(voltage_to_phase_deg(3.0, 5.0), 108.0)
+        self.assertAlmostEqual(phase_deg_to_voltage(108.0, 5.0), 3.0)
+
+    def test_phase_bias_inputs_match_equivalent_voltage_spectra(self) -> None:
+        vpi_i = 5.0
+        vpi_q = 6.0
+        vpi_p = 4.0
+        phase_i = 108.0
+        phase_q = -45.0
+        phase_p = 180.0
+        phase_equivalent = DPMZMParams(
+            voltage_i=phase_deg_to_voltage(phase_i, vpi_i),
+            voltage_q=phase_deg_to_voltage(phase_q, vpi_q),
+            voltage_p=phase_deg_to_voltage(phase_p, vpi_p),
+            vpi_i=vpi_i,
+            vpi_q=vpi_q,
+            vpi_p=vpi_p,
+            sideband_order=3,
+        )
+        voltage_equivalent = DPMZMParams(
+            voltage_i=3.0,
+            voltage_q=-1.5,
+            voltage_p=4.0,
+            vpi_i=vpi_i,
+            vpi_q=vpi_q,
+            vpi_p=vpi_p,
+            sideband_order=3,
+        )
+
+        phase_spectra = simulate_spectra(phase_equivalent)
+        voltage_spectra = simulate_spectra(voltage_equivalent)
+
+        for view in VIEW_ORDER:
+            for phase_line, voltage_line in zip(phase_spectra[view], voltage_spectra[view]):
+                self.assertEqual(phase_line.order, voltage_line.order)
+                self.assertAlmostEqual(phase_line.real, voltage_line.real, places=12)
+                self.assertAlmostEqual(phase_line.imag, voltage_line.imag, places=12)
+                self.assertAlmostEqual(phase_line.power, voltage_line.power, places=12)
+
+    def test_p_phase_180_matches_p_bias_of_one_vpi(self) -> None:
+        phase_params = DPMZMParams(
+            voltage_p=phase_deg_to_voltage(180.0, 5.0),
+            vpi_p=5.0,
+            sideband_order=3,
+        )
+        voltage_params = DPMZMParams(voltage_p=5.0, vpi_p=5.0, sideband_order=3)
+
+        phase_lines = simulate_spectra(phase_params)[VIEW_Q_AFTER_P]
+        voltage_lines = simulate_spectra(voltage_params)[VIEW_Q_AFTER_P]
+
+        for phase_line, voltage_line in zip(phase_lines, voltage_lines):
+            self.assertEqual(phase_line.order, voltage_line.order)
+            self.assertAlmostEqual(phase_line.real, voltage_line.real, places=12)
+            self.assertAlmostEqual(phase_line.imag, voltage_line.imag, places=12)
 
     def test_phase_to_display_angle_mapping(self) -> None:
         self.assertEqual(phase_to_display_angle_deg(0.0), 90.0)

@@ -34,6 +34,24 @@ ARROW_BASE_LENGTH_PX = 56.0
 HOVER_DISTANCE_PX = 18.0
 DISPLAY_MODE_OVERVIEW = "总览"
 DISPLAY_MODE_ARMS = "臂分解"
+BIAS_INPUT_MODE_VOLTAGE = "偏压(V)"
+BIAS_INPUT_MODE_PHASE = "相位(deg)"
+
+
+def voltage_to_phase_deg(voltage: float, vpi: float) -> float:
+    """Convert a bias voltage to the equivalent static phase in degrees."""
+
+    if vpi == 0.0:
+        raise ValueError("Vpi不能为0。")
+    return 180.0 * voltage / vpi
+
+
+def phase_deg_to_voltage(phase_deg: float, vpi: float) -> float:
+    """Convert a static phase in degrees to the equivalent bias voltage."""
+
+    if vpi == 0.0:
+        raise ValueError("Vpi不能为0。")
+    return phase_deg * vpi / 180.0
 
 
 def is_visible_sideband(line: SpectralLine) -> bool:
@@ -73,6 +91,9 @@ class DPMZMSpectrumApp(tk.Tk):
         self._update_job: str | None = None
         self.vars: dict[str, tk.StringVar] = {}
         self.display_mode_var = tk.StringVar(value=DISPLAY_MODE_OVERVIEW)
+        self.bias_input_mode_var = tk.StringVar(value=BIAS_INPUT_MODE_VOLTAGE)
+        self._last_bias_input_mode = BIAS_INPUT_MODE_VOLTAGE
+        self.bias_value_labels: dict[str, ttk.Label] = {}
         self.current_params = default_params()
         self.current_spectra = None
         self.hover_targets: list[dict[str, object]] = []
@@ -139,17 +160,50 @@ class DPMZMSpectrumApp(tk.Tk):
         combo.bind("<<ComboboxSelected>>", lambda _event: self._update_plot(show_error=True))
 
     def _add_bias_controls(self, parent: ttk.Frame) -> None:
-        frame = ttk.LabelFrame(parent, text="直流偏压与Vpi", padding=10)
+        frame = ttk.LabelFrame(parent, text="偏置输入与Vpi", padding=10)
         frame.pack(fill="x", pady=(0, 10))
-        fields = [
-            ("voltage_i", "I路偏压 VI (V)", self.current_params.voltage_i),
-            ("voltage_q", "Q路偏压 VQ (V)", self.current_params.voltage_q),
-            ("voltage_p", "P路偏压 VP (V)", self.current_params.voltage_p),
+
+        ttk.Label(frame, text="输入方式").grid(row=0, column=0, sticky="w", pady=3)
+        combo = ttk.Combobox(
+            frame,
+            textvariable=self.bias_input_mode_var,
+            values=(BIAS_INPUT_MODE_VOLTAGE, BIAS_INPUT_MODE_PHASE),
+            state="readonly",
+            width=14,
+        )
+        combo.grid(row=0, column=1, sticky="ew", padx=(8, 0), pady=3)
+        combo.bind("<<ComboboxSelected>>", self._on_bias_input_mode_changed)
+
+        bias_fields = [
+            ("voltage_i", self.current_params.voltage_i),
+            ("voltage_q", self.current_params.voltage_q),
+            ("voltage_p", self.current_params.voltage_p),
+        ]
+        for offset, (key, value) in enumerate(bias_fields, start=1):
+            label = ttk.Label(frame, text="")
+            label.grid(row=offset, column=0, sticky="w", pady=3)
+            var = tk.StringVar(value=self._format_default(value))
+            entry = ttk.Entry(frame, textvariable=var, width=16)
+            entry.grid(row=offset, column=1, sticky="ew", padx=(8, 0), pady=3)
+            entry.bind("<Return>", lambda _event: self._update_plot(show_error=True))
+            self.vars[key] = var
+            self.bias_value_labels[key] = label
+
+        vpi_fields = [
             ("vpi_i", "I路 Vpi (V)", self.current_params.vpi_i),
             ("vpi_q", "Q路 Vpi (V)", self.current_params.vpi_q),
             ("vpi_p", "P路 Vpi (V)", self.current_params.vpi_p),
         ]
-        self._add_entry_grid(frame, fields)
+        for offset, (key, label_text, value) in enumerate(vpi_fields, start=4):
+            ttk.Label(frame, text=label_text).grid(row=offset, column=0, sticky="w", pady=3)
+            var = tk.StringVar(value=self._format_default(value))
+            entry = ttk.Entry(frame, textvariable=var, width=16)
+            entry.grid(row=offset, column=1, sticky="ew", padx=(8, 0), pady=3)
+            entry.bind("<Return>", lambda _event: self._update_plot(show_error=True))
+            self.vars[key] = var
+
+        frame.columnconfigure(1, weight=1)
+        self._refresh_bias_labels()
 
     def _add_rf_controls(self, parent: ttk.Frame) -> None:
         frame = ttk.LabelFrame(parent, text="单音RF与边带", padding=10)
@@ -189,7 +243,7 @@ class DPMZMSpectrumApp(tk.Tk):
         ttk.Button(frame, text="导出CSV", command=self._export_csv).pack(fill="x", pady=3)
 
         note = (
-            "说明：I/Q子MZM按推挽建模；图面只显示边带相位矢量。"
+            "说明：I/Q子MZM按推挽建模；偏置可用电压或相位输入。"
             "功率不再作为纵坐标，鼠标悬停到边带时显示。"
         )
         ttk.Label(parent, text=note, wraplength=245, foreground="#555").pack(
@@ -210,8 +264,69 @@ class DPMZMSpectrumApp(tk.Tk):
         self._update_job = None
         self._update_plot(show_error=False)
 
+    def _on_bias_input_mode_changed(self, _event=None) -> None:
+        new_mode = self.bias_input_mode_var.get()
+        old_mode = self._last_bias_input_mode
+        if new_mode == old_mode:
+            return
+
+        try:
+            vpi_i = self._parse_float("vpi_i")
+            vpi_q = self._parse_float("vpi_q")
+            vpi_p = self._parse_float("vpi_p")
+            values = {
+                "voltage_i": self._parse_float("voltage_i"),
+                "voltage_q": self._parse_float("voltage_q"),
+                "voltage_p": self._parse_float("voltage_p"),
+            }
+            if old_mode == BIAS_INPUT_MODE_VOLTAGE and new_mode == BIAS_INPUT_MODE_PHASE:
+                converted = {
+                    "voltage_i": voltage_to_phase_deg(values["voltage_i"], vpi_i),
+                    "voltage_q": voltage_to_phase_deg(values["voltage_q"], vpi_q),
+                    "voltage_p": voltage_to_phase_deg(values["voltage_p"], vpi_p),
+                }
+            elif old_mode == BIAS_INPUT_MODE_PHASE and new_mode == BIAS_INPUT_MODE_VOLTAGE:
+                converted = {
+                    "voltage_i": phase_deg_to_voltage(values["voltage_i"], vpi_i),
+                    "voltage_q": phase_deg_to_voltage(values["voltage_q"], vpi_q),
+                    "voltage_p": phase_deg_to_voltage(values["voltage_p"], vpi_p),
+                }
+            else:
+                converted = values
+        except Exception as exc:
+            self.bias_input_mode_var.set(old_mode)
+            self._refresh_bias_labels()
+            self.status_var.set(f"输入方式切换失败：{exc}")
+            messagebox.showerror("输入方式切换失败", str(exc))
+            return
+
+        self._last_bias_input_mode = new_mode
+        self._refresh_bias_labels()
+        for key, value in converted.items():
+            self.vars[key].set(self._format_default(value))
+        self._update_plot(show_error=True)
+
+    def _refresh_bias_labels(self) -> None:
+        if self.bias_input_mode_var.get() == BIAS_INPUT_MODE_PHASE:
+            labels = {
+                "voltage_i": "I路相位 φI (deg)",
+                "voltage_q": "Q路相位 φQ (deg)",
+                "voltage_p": "P路相位 φP (deg)",
+            }
+        else:
+            labels = {
+                "voltage_i": "I路偏压 VI (V)",
+                "voltage_q": "Q路偏压 VQ (V)",
+                "voltage_p": "P路偏压 VP (V)",
+            }
+        for key, label_text in labels.items():
+            self.bias_value_labels[key].configure(text=label_text)
+
     def _reset_params(self) -> None:
         params = default_params()
+        self.bias_input_mode_var.set(BIAS_INPUT_MODE_VOLTAGE)
+        self._last_bias_input_mode = BIAS_INPUT_MODE_VOLTAGE
+        self._refresh_bias_labels()
         for key, value in {
             "voltage_i": params.voltage_i,
             "voltage_q": params.voltage_q,
@@ -231,10 +346,19 @@ class DPMZMSpectrumApp(tk.Tk):
     def _parse_params(self) -> DPMZMParams:
         values = {key: self._parse_float(key) for key in self.vars if key != "sideband_order"}
         sideband_order = self._parse_int("sideband_order")
+        if self.bias_input_mode_var.get() == BIAS_INPUT_MODE_PHASE:
+            voltage_i = phase_deg_to_voltage(values["voltage_i"], values["vpi_i"])
+            voltage_q = phase_deg_to_voltage(values["voltage_q"], values["vpi_q"])
+            voltage_p = phase_deg_to_voltage(values["voltage_p"], values["vpi_p"])
+        else:
+            voltage_i = values["voltage_i"]
+            voltage_q = values["voltage_q"]
+            voltage_p = values["voltage_p"]
+
         return DPMZMParams(
-            voltage_i=values["voltage_i"],
-            voltage_q=values["voltage_q"],
-            voltage_p=values["voltage_p"],
+            voltage_i=voltage_i,
+            voltage_q=voltage_q,
+            voltage_p=voltage_p,
             vpi_i=values["vpi_i"],
             vpi_q=values["vpi_q"],
             vpi_p=values["vpi_p"],
