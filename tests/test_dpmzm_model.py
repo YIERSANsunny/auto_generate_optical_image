@@ -10,6 +10,7 @@ import numpy as np
 from scipy.special import jv
 
 from dpmzm_model import (
+    ARM_VIEW_ORDER,
     DPMZMParams,
     PUSH_PULL_ARM_RF_PHASE_DIFF_DEG,
     SpectralLine,
@@ -18,7 +19,9 @@ from dpmzm_model import (
     VIEW_ORDER,
     VIEW_Q_AFTER_P,
     child_mzm_coefficients,
-    phase_to_arrow_angle_deg,
+    child_mzm_components,
+    phase_to_display_angle_deg,
+    simulate_arm_spectra,
     simulate_spectra,
     write_spectra_csv,
 )
@@ -72,6 +75,35 @@ class DPMZMModelTests(unittest.TestCase):
             self.assertAlmostEqual(coefficients[order].real, expected.real, places=12)
             self.assertAlmostEqual(coefficients[order].imag, expected.imag, places=12)
 
+    def test_child_mzm_components_sum_to_total(self) -> None:
+        components = child_mzm_components(
+            bias_voltage=1.1,
+            vpi=4.0,
+            rf_peak_voltage=0.7,
+            sideband_order=2,
+            rf_relative_phase_deg=35.0,
+        )
+
+        for order in [-2, -1, 0, 1, 2]:
+            expected = components.upper[order] + components.lower[order]
+            self.assertAlmostEqual(components.total[order].real, expected.real, places=12)
+            self.assertAlmostEqual(components.total[order].imag, expected.imag, places=12)
+
+    def test_child_mzm_coefficients_wrap_component_total(self) -> None:
+        kwargs = {
+            "bias_voltage": 0.9,
+            "vpi": 4.0,
+            "rf_peak_voltage": 0.7,
+            "sideband_order": 3,
+            "rf_relative_phase_deg": 30.0,
+        }
+        components = child_mzm_components(**kwargs)
+        coefficients = child_mzm_coefficients(**kwargs)
+
+        for order in range(-3, 4):
+            self.assertAlmostEqual(coefficients[order].real, components.total[order].real, places=12)
+            self.assertAlmostEqual(coefficients[order].imag, components.total[order].imag, places=12)
+
     def test_negative_sideband_signs_follow_bessel_expansion(self) -> None:
         coefficients = child_mzm_coefficients(
             bias_voltage=1.0,
@@ -86,7 +118,7 @@ class DPMZMModelTests(unittest.TestCase):
         self.assertAlmostEqual(coefficients[-2].imag, coefficients[2].imag, places=12)
 
     def test_zero_bias_push_pull_cancels_odd_sidebands(self) -> None:
-        coefficients = child_mzm_coefficients(
+        components = child_mzm_components(
             bias_voltage=0.0,
             vpi=4.0,
             rf_peak_voltage=0.8,
@@ -94,19 +126,21 @@ class DPMZMModelTests(unittest.TestCase):
         )
 
         for order in [-5, -3, -1, 1, 3, 5]:
-            self.assertLess(abs(coefficients[order]), 1e-12)
+            self.assertGreater(abs(components.upper[order]), 1e-12)
+            self.assertGreater(abs(components.lower[order]), 1e-12)
+            self.assertLess(abs(components.total[order]), 1e-12)
         for order in [-4, -2, 0, 2, 4]:
-            self.assertGreater(abs(coefficients[order]), 1e-12)
+            self.assertGreater(abs(components.total[order]), 1e-12)
 
     def test_q_rf_relative_phase_rotates_each_sideband_by_order(self) -> None:
-        base = child_mzm_coefficients(
+        base = child_mzm_components(
             bias_voltage=0.9,
             vpi=4.0,
             rf_peak_voltage=0.7,
             sideband_order=3,
             rf_relative_phase_deg=0.0,
         )
-        shifted = child_mzm_coefficients(
+        shifted = child_mzm_components(
             bias_voltage=0.9,
             vpi=4.0,
             rf_peak_voltage=0.7,
@@ -116,9 +150,12 @@ class DPMZMModelTests(unittest.TestCase):
 
         psi = math.radians(30.0)
         for order in [-3, -2, -1, 0, 1, 2, 3]:
-            expected = base[order] * np.exp(1j * order * psi)
-            self.assertAlmostEqual(shifted[order].real, expected.real, places=12)
-            self.assertAlmostEqual(shifted[order].imag, expected.imag, places=12)
+            rotation = np.exp(1j * order * psi)
+            for attr in ("upper", "lower", "total"):
+                expected = getattr(base, attr)[order] * rotation
+                actual = getattr(shifted, attr)[order]
+                self.assertAlmostEqual(actual.real, expected.real, places=12)
+                self.assertAlmostEqual(actual.imag, expected.imag, places=12)
 
     def test_p_bias_shift_by_one_vpi_rotates_q_after_p_by_180_degrees(self) -> None:
         base = simulate_spectra(DPMZMParams(sideband_order=4))
@@ -162,13 +199,18 @@ class DPMZMModelTests(unittest.TestCase):
             self.assertAlmostEqual(actual.real, expected.real, places=12)
             self.assertAlmostEqual(actual.imag, expected.imag, places=12)
 
-    def test_phase_to_arrow_angle_mapping(self) -> None:
-        self.assertEqual(phase_to_arrow_angle_deg(0.0), 90.0)
-        self.assertEqual(phase_to_arrow_angle_deg(180.0), -90.0)
-        self.assertEqual(phase_to_arrow_angle_deg(-180.0), -90.0)
-        self.assertEqual(phase_to_arrow_angle_deg(90.0), 0.0)
+    def test_phase_to_display_angle_mapping(self) -> None:
+        self.assertEqual(phase_to_display_angle_deg(0.0), 90.0)
+        self.assertEqual(phase_to_display_angle_deg(0.5), 90.0)
+        self.assertEqual(phase_to_display_angle_deg(90.0), 90.0)
+        self.assertEqual(phase_to_display_angle_deg(-90.0), -90.0)
+        self.assertEqual(phase_to_display_angle_deg(180.0), -90.0)
+        self.assertEqual(phase_to_display_angle_deg(179.5), -90.0)
+        self.assertEqual(phase_to_display_angle_deg(-180.0), -90.0)
+        self.assertEqual(phase_to_display_angle_deg(45.0), 45.0)
+        self.assertEqual(phase_to_display_angle_deg(-45.0), -45.0)
 
-    def test_csv_export_contains_all_views_orders_and_arrow_angle(self) -> None:
+    def test_csv_export_contains_all_views_orders_and_true_phase_only(self) -> None:
         params = DPMZMParams(sideband_order=2)
         spectra = simulate_spectra(params)
 
@@ -185,7 +227,30 @@ class DPMZMModelTests(unittest.TestCase):
             [-2, -1, 0, 1, 2],
         )
         self.assertIn("phase_deg", rows[0])
-        self.assertIn("arrow_angle_deg", rows[0])
+        self.assertNotIn("arrow_angle_deg", rows[0])
+
+    def test_arm_spectra_contains_iq_arms_and_totals(self) -> None:
+        params = DPMZMParams(sideband_order=2)
+        spectra = simulate_arm_spectra(params)
+
+        self.assertEqual(set(spectra), set(ARM_VIEW_ORDER))
+        for lines in spectra.values():
+            self.assertEqual([line.order for line in lines], [-2, -1, 0, 1, 2])
+
+    def test_arm_spectra_csv_exports_arm_views(self) -> None:
+        params = DPMZMParams(sideband_order=1)
+        spectra = simulate_arm_spectra(params)
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            path = Path(temp_dir) / "arm_spectra.csv"
+            write_spectra_csv(spectra, path)
+            with path.open(newline="", encoding="utf-8-sig") as csv_file:
+                rows = list(csv.DictReader(csv_file))
+
+        self.assertEqual(len(rows), len(ARM_VIEW_ORDER) * (2 * params.sideband_order + 1))
+        self.assertEqual({row["view"] for row in rows}, set(ARM_VIEW_ORDER))
+        self.assertIn("phase_deg", rows[0])
+        self.assertNotIn("arrow_angle_deg", rows[0])
 
     def test_vector_arrow_length_px_is_gently_scaled_and_monotonic(self) -> None:
         weak = _line_with_db(-60.0)
@@ -211,6 +276,33 @@ class DPMZMModelTests(unittest.TestCase):
         self.assertAlmostEqual(right_dy, 0.0, places=12)
         self.assertLess(left_dx, 0.0)
         self.assertAlmostEqual(left_dy, 0.0, places=12)
+
+    def test_phase_display_mapping_drives_expected_arrow_directions(self) -> None:
+        zero_dx, zero_dy = arrow_display_delta_px(phase_to_display_angle_deg(0.0), 10.0)
+        ninety_dx, ninety_dy = arrow_display_delta_px(phase_to_display_angle_deg(90.0), 10.0)
+        minus_ninety_dx, minus_ninety_dy = arrow_display_delta_px(
+            phase_to_display_angle_deg(-90.0),
+            10.0,
+        )
+        one_eighty_dx, one_eighty_dy = arrow_display_delta_px(
+            phase_to_display_angle_deg(180.0),
+            10.0,
+        )
+        forty_five_dx, forty_five_dy = arrow_display_delta_px(
+            phase_to_display_angle_deg(45.0),
+            10.0,
+        )
+
+        self.assertAlmostEqual(zero_dx, 0.0, places=12)
+        self.assertGreater(zero_dy, 0.0)
+        self.assertAlmostEqual(ninety_dx, 0.0, places=12)
+        self.assertGreater(ninety_dy, 0.0)
+        self.assertAlmostEqual(minus_ninety_dx, 0.0, places=12)
+        self.assertLess(minus_ninety_dy, 0.0)
+        self.assertAlmostEqual(one_eighty_dx, 0.0, places=12)
+        self.assertLess(one_eighty_dy, 0.0)
+        self.assertGreater(forty_five_dx, 0.0)
+        self.assertGreater(forty_five_dy, 0.0)
 
     def test_low_power_sidebands_are_not_visible_or_hover_targets(self) -> None:
         self.assertTrue(is_visible_sideband(_line_with_db(-60.0)))
@@ -264,7 +356,6 @@ def _line_with_db(magnitude_db: float) -> SpectralLine:
         magnitude=10 ** (magnitude_db / 20.0),
         magnitude_db=magnitude_db,
         phase_deg=0.0,
-        arrow_angle_deg=90.0,
         real=1.0,
         imag=0.0,
     )

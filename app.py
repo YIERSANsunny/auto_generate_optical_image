@@ -17,10 +17,13 @@ from matplotlib.figure import Figure
 from matplotlib.transforms import offset_copy
 
 from dpmzm_model import (
+    ARM_VIEW_ORDER,
     DPMZMParams,
     SpectralLine,
     VIEW_ORDER,
     default_params,
+    phase_to_display_angle_deg,
+    simulate_arm_spectra,
     simulate_spectra,
     write_spectra_csv,
 )
@@ -29,6 +32,8 @@ from dpmzm_model import (
 PHASE_LABEL_DB_THRESHOLD = -60.0
 ARROW_BASE_LENGTH_PX = 56.0
 HOVER_DISTANCE_PX = 18.0
+DISPLAY_MODE_OVERVIEW = "总览"
+DISPLAY_MODE_ARMS = "臂分解"
 
 
 def is_visible_sideband(line: SpectralLine) -> bool:
@@ -49,10 +54,10 @@ def vector_arrow_length_px(line: SpectralLine) -> float:
     return ARROW_BASE_LENGTH_PX * (0.75 + 0.25 * normalized_magnitude)
 
 
-def arrow_display_delta_px(arrow_angle_deg: float, length_px: float) -> tuple[float, float]:
+def arrow_display_delta_px(display_angle_deg: float, length_px: float) -> tuple[float, float]:
     """Return the display-space x/y offset for an arrow angle and length."""
 
-    angle_rad = math.radians(arrow_angle_deg)
+    angle_rad = math.radians(display_angle_deg)
     return length_px * math.cos(angle_rad), length_px * math.sin(angle_rad)
 
 
@@ -67,6 +72,7 @@ class DPMZMSpectrumApp(tk.Tk):
 
         self._update_job: str | None = None
         self.vars: dict[str, tk.StringVar] = {}
+        self.display_mode_var = tk.StringVar(value=DISPLAY_MODE_OVERVIEW)
         self.current_params = default_params()
         self.current_spectra = None
         self.hover_targets: list[dict[str, object]] = []
@@ -93,6 +99,7 @@ class DPMZMSpectrumApp(tk.Tk):
         controls = ttk.Frame(self, padding=(12, 12, 8, 12))
         controls.grid(row=0, column=0, sticky="ns")
 
+        self._add_display_controls(controls)
         self._add_bias_controls(controls)
         self._add_rf_controls(controls)
         self._add_action_buttons(controls)
@@ -117,6 +124,19 @@ class DPMZMSpectrumApp(tk.Tk):
             columnspan=2,
             sticky="ew",
         )
+
+    def _add_display_controls(self, parent: ttk.Frame) -> None:
+        frame = ttk.LabelFrame(parent, text="显示模式", padding=10)
+        frame.pack(fill="x", pady=(0, 10))
+        combo = ttk.Combobox(
+            frame,
+            textvariable=self.display_mode_var,
+            values=(DISPLAY_MODE_OVERVIEW, DISPLAY_MODE_ARMS),
+            state="readonly",
+            width=14,
+        )
+        combo.pack(fill="x")
+        combo.bind("<<ComboboxSelected>>", lambda _event: self._update_plot(show_error=True))
 
     def _add_bias_controls(self, parent: ttk.Frame) -> None:
         frame = ttk.LabelFrame(parent, text="直流偏压与Vpi", padding=10)
@@ -246,7 +266,13 @@ class DPMZMSpectrumApp(tk.Tk):
             self._update_job = None
         try:
             params = self._parse_params()
-            spectra = simulate_spectra(params)
+            mode = self.display_mode_var.get()
+            if mode == DISPLAY_MODE_ARMS:
+                spectra = simulate_arm_spectra(params)
+                view_order = ARM_VIEW_ORDER
+            else:
+                spectra = simulate_spectra(params)
+                view_order = VIEW_ORDER
         except Exception as exc:
             self.status_var.set(f"参数错误：{exc}")
             if show_error:
@@ -255,18 +281,24 @@ class DPMZMSpectrumApp(tk.Tk):
 
         self.current_params = params
         self.current_spectra = spectra
-        self._draw_spectra(params, spectra)
-        self.status_var.set("已更新图像")
+        self._draw_spectra(params, spectra, view_order)
+        self.status_var.set(f"已更新图像：{mode}")
 
-    def _draw_spectra(self, params: DPMZMParams, spectra) -> None:
+    def _draw_spectra(
+        self,
+        params: DPMZMParams,
+        spectra,
+        view_order: tuple[str, ...],
+    ) -> None:
         self.figure.clear()
-        axes = self.figure.subplots(2, 2, sharex=True, sharey=True).ravel()
+        columns = 3 if view_order == ARM_VIEW_ORDER else 2
+        axes = self.figure.subplots(2, columns, sharex=True, sharey=True, squeeze=False).ravel()
         cmap = colormaps["twilight_shifted"]
         norm = Normalize(vmin=-180.0, vmax=180.0)
         self.hover_targets = []
         self.hover_annotation = None
 
-        for index, (axis, view) in enumerate(zip(axes, VIEW_ORDER)):
+        for index, (axis, view) in enumerate(zip(axes, view_order)):
             axis.axhline(0.0, color="#777", linewidth=1.1, alpha=0.8)
             axis.grid(True, linewidth=0.5, alpha=0.24)
             axis.set_title(view, fontsize=13, pad=8)
@@ -275,11 +307,14 @@ class DPMZMSpectrumApp(tk.Tk):
             axis.set_xticks(list(range(-params.sideband_order, params.sideband_order + 1)))
             axis.set_yticks([])
             axis.set_ylabel("")
-            axis.tick_params(axis="x", length=0, labelbottom=index >= 2)
+            is_bottom_row = index >= columns
+            axis.tick_params(axis="x", length=0, labelbottom=is_bottom_row)
             axis.spines["left"].set_visible(False)
             axis.spines["right"].set_visible(False)
             axis.spines["top"].set_visible(False)
             axis.spines["bottom"].set_visible(False)
+            if is_bottom_row:
+                axis.set_xlabel("边带阶数 k")
 
             for line in spectra[view]:
                 if not is_visible_sideband(line):
@@ -287,8 +322,7 @@ class DPMZMSpectrumApp(tk.Tk):
                 color = cmap(norm(line.phase_deg))
                 self._draw_phase_arrow(axis, line, color)
 
-        axes[2].set_xlabel("边带阶数 k")
-        axes[3].set_xlabel(f"边带阶数 k，频偏 = k × {params.rf_frequency_ghz:g} GHz")
+        axes[-1].set_xlabel(f"边带阶数 k，频偏 = k × {params.rf_frequency_ghz:g} GHz")
 
         scalar_mappable = matplotlib.cm.ScalarMappable(norm=norm, cmap=cmap)
         scalar_mappable.set_array([])
@@ -306,7 +340,8 @@ class DPMZMSpectrumApp(tk.Tk):
     def _draw_phase_arrow(self, axis, line: SpectralLine, color) -> None:
         start = (line.order, 0.0)
         length_px = vector_arrow_length_px(line)
-        dx_px, dy_px = arrow_display_delta_px(line.arrow_angle_deg, length_px)
+        display_angle_deg = phase_to_display_angle_deg(line.phase_deg)
+        dx_px, dy_px = arrow_display_delta_px(display_angle_deg, length_px)
         tip_transform = offset_copy(
             axis.transData,
             fig=self.figure,
@@ -430,7 +465,6 @@ class DPMZMSpectrumApp(tk.Tk):
             f"边带阶数: {line.order:+d}\n"
             f"频偏: {line.freq_offset_ghz:+.6g} GHz\n"
             f"真实相位: {line.phase_deg:+.2f}°\n"
-            f"箭头角度: {line.arrow_angle_deg:+.2f}°\n"
             f"线性幅度: {line.magnitude:.6g}\n"
             f"归一化功率: {line.magnitude_db:.2f} dB\n"
             f"复数: {line.real:+.6g} {line.imag:+.6g}j"
