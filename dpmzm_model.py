@@ -67,7 +67,9 @@ class SpectralLine:
     order: int
     freq_offset_ghz: float
     magnitude: float
+    power: float
     magnitude_db: float
+    power_db: float
     phase_deg: float
     real: float
     imag: float
@@ -258,6 +260,7 @@ def _coeff_sets_to_spectra(
     )
     if max_magnitude <= 0.0:
         max_magnitude = 1.0
+    max_power = max_magnitude**2
 
     spectra: dict[str, list[SpectralLine]] = {}
     for view in view_order:
@@ -265,7 +268,9 @@ def _coeff_sets_to_spectra(
         for order in _orders(params.sideband_order):
             coefficient = raw[view][order]
             magnitude = float(abs(coefficient))
+            power = magnitude**2
             magnitude_db = _relative_db(magnitude, max_magnitude)
+            power_db = _relative_power_db(power, max_power)
             phase_deg = _wrap_phase_deg(math.degrees(float(np.angle(coefficient))))
             lines.append(
                 SpectralLine(
@@ -273,7 +278,9 @@ def _coeff_sets_to_spectra(
                     order=order,
                     freq_offset_ghz=order * params.rf_frequency_ghz,
                     magnitude=magnitude,
+                    power=power,
                     magnitude_db=magnitude_db,
+                    power_db=power_db,
                     phase_deg=phase_deg,
                     real=float(np.real(coefficient)),
                     imag=float(np.imag(coefficient)),
@@ -325,7 +332,9 @@ def write_spectra_csv(
         "order",
         "freq_offset_ghz",
         "magnitude",
+        "power",
         "magnitude_db",
+        "power_db",
         "phase_deg",
         "real",
         "imag",
@@ -340,7 +349,9 @@ def write_spectra_csv(
                     "order": line.order,
                     "freq_offset_ghz": _format_float(line.freq_offset_ghz),
                     "magnitude": _format_float(line.magnitude),
+                    "power": _format_float(line.power),
                     "magnitude_db": _format_float(line.magnitude_db),
+                    "power_db": _format_float(line.power_db),
                     "phase_deg": _format_float(line.phase_deg),
                     "real": _format_float(line.real),
                     "imag": _format_float(line.imag),
@@ -356,6 +367,12 @@ def _relative_db(magnitude: float, reference: float) -> float:
     if magnitude <= 1e-15:
         return -300.0
     return 20.0 * math.log10(magnitude / reference)
+
+
+def _relative_power_db(power: float, reference: float) -> float:
+    if power <= 1e-30:
+        return -300.0
+    return 10.0 * math.log10(power / reference)
 
 
 def _wrap_phase_deg(value: float) -> float:

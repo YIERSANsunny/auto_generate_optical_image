@@ -465,8 +465,9 @@ class DPMZMSpectrumApp(tk.Tk):
             f"边带阶数: {line.order:+d}\n"
             f"频偏: {line.freq_offset_ghz:+.6g} GHz\n"
             f"真实相位: {line.phase_deg:+.2f}°\n"
-            f"线性幅度: {line.magnitude:.6g}\n"
-            f"归一化功率: {line.magnitude_db:.2f} dB\n"
+            f"场幅 |Ck|: {line.magnitude:.6g}\n"
+            f"光功率 |Ck|²: {line.power:.6g}\n"
+            f"相对功率: {line.power_db:.2f} dB\n"
             f"复数: {line.real:+.6g} {line.imag:+.6g}j"
         )
 

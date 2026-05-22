@@ -75,6 +75,35 @@ class DPMZMModelTests(unittest.TestCase):
             self.assertAlmostEqual(coefficients[order].real, expected.real, places=12)
             self.assertAlmostEqual(coefficients[order].imag, expected.imag, places=12)
 
+    def test_child_mzm_components_match_sampled_time_domain_push_pull(self) -> None:
+        vpi = 4.0
+        bias_voltage = 1.1
+        rf_peak_voltage = 0.7
+        rf_relative_phase_deg = 35.0
+        sideband_order = 3
+
+        components = child_mzm_components(
+            bias_voltage=bias_voltage,
+            vpi=vpi,
+            rf_peak_voltage=rf_peak_voltage,
+            sideband_order=sideband_order,
+            rf_relative_phase_deg=rf_relative_phase_deg,
+        )
+        sampled = _sampled_child_mzm_components(
+            bias_voltage=bias_voltage,
+            vpi=vpi,
+            rf_peak_voltage=rf_peak_voltage,
+            sideband_order=sideband_order,
+            rf_relative_phase_deg=rf_relative_phase_deg,
+        )
+
+        for order in range(-sideband_order, sideband_order + 1):
+            for attr in ("upper", "lower", "total"):
+                expected = sampled[attr][order]
+                actual = getattr(components, attr)[order]
+                self.assertAlmostEqual(actual.real, expected.real, places=11)
+                self.assertAlmostEqual(actual.imag, expected.imag, places=11)
+
     def test_child_mzm_components_sum_to_total(self) -> None:
         components = child_mzm_components(
             bias_voltage=1.1,
@@ -199,6 +228,34 @@ class DPMZMModelTests(unittest.TestCase):
             self.assertAlmostEqual(actual.real, expected.real, places=12)
             self.assertAlmostEqual(actual.imag, expected.imag, places=12)
 
+    def test_power_fields_are_derived_after_complex_field_calculation(self) -> None:
+        spectra = simulate_spectra(DPMZMParams(voltage_i=0.8, voltage_q=-0.3, voltage_p=1.2))
+        lines = [line for view_lines in spectra.values() for line in view_lines]
+        max_power = max(line.power for line in lines)
+
+        for line in lines:
+            expected_power = line.real**2 + line.imag**2
+            self.assertAlmostEqual(line.power, expected_power, places=12)
+            self.assertAlmostEqual(line.power, line.magnitude**2, places=12)
+            self.assertAlmostEqual(line.power_db, line.magnitude_db, places=12)
+            if line.power > 1e-30:
+                self.assertAlmostEqual(
+                    line.power_db,
+                    10.0 * math.log10(line.power / max_power),
+                    places=12,
+                )
+
+    def test_coupled_phase_is_derived_from_complex_output_field(self) -> None:
+        spectra = simulate_spectra(DPMZMParams(voltage_i=0.8, voltage_q=-0.3, voltage_p=1.2))
+
+        for line in spectra[VIEW_COUPLED]:
+            expected_phase = math.degrees(math.atan2(line.imag, line.real))
+            self.assertAlmostEqual(
+                _phase_delta_deg(line.phase_deg, expected_phase),
+                0.0,
+                places=12,
+            )
+
     def test_phase_to_display_angle_mapping(self) -> None:
         self.assertEqual(phase_to_display_angle_deg(0.0), 90.0)
         self.assertEqual(phase_to_display_angle_deg(0.5), 90.0)
@@ -227,6 +284,8 @@ class DPMZMModelTests(unittest.TestCase):
             [-2, -1, 0, 1, 2],
         )
         self.assertIn("phase_deg", rows[0])
+        self.assertIn("power", rows[0])
+        self.assertIn("power_db", rows[0])
         self.assertNotIn("arrow_angle_deg", rows[0])
 
     def test_arm_spectra_contains_iq_arms_and_totals(self) -> None:
@@ -250,6 +309,8 @@ class DPMZMModelTests(unittest.TestCase):
         self.assertEqual(len(rows), len(ARM_VIEW_ORDER) * (2 * params.sideband_order + 1))
         self.assertEqual({row["view"] for row in rows}, set(ARM_VIEW_ORDER))
         self.assertIn("phase_deg", rows[0])
+        self.assertIn("power", rows[0])
+        self.assertIn("power_db", rows[0])
         self.assertNotIn("arrow_angle_deg", rows[0])
 
     def test_vector_arrow_length_px_is_gently_scaled_and_monotonic(self) -> None:
@@ -344,17 +405,54 @@ def _manual_bessel_coefficient(
     )
 
 
+def _sampled_child_mzm_components(
+    *,
+    bias_voltage: float,
+    vpi: float,
+    rf_peak_voltage: float,
+    sideband_order: int,
+    rf_relative_phase_deg: float,
+) -> dict[str, dict[int, complex]]:
+    sample_count = 65536
+    theta = np.linspace(0.0, 2.0 * math.pi, sample_count, endpoint=False)
+    delta = math.pi * bias_voltage / vpi
+    phi_1 = 0.5 * delta
+    phi_2 = -0.5 * delta
+    modulation_depth = math.pi * rf_peak_voltage / vpi
+    rf_relative_phase = math.radians(rf_relative_phase_deg)
+    rf_phase = theta + rf_relative_phase
+
+    upper_signal = 0.5 * np.exp(1j * (phi_1 + modulation_depth * np.sin(rf_phase)))
+    lower_signal = 0.5 * np.exp(1j * (phi_2 - modulation_depth * np.sin(rf_phase)))
+    total_signal = upper_signal + lower_signal
+
+    def coefficients(signal) -> dict[int, complex]:
+        return {
+            order: complex(np.mean(signal * np.exp(-1j * order * theta)))
+            for order in range(-sideband_order, sideband_order + 1)
+        }
+
+    return {
+        "upper": coefficients(upper_signal),
+        "lower": coefficients(lower_signal),
+        "total": coefficients(total_signal),
+    }
+
+
 def _phase_delta_deg(start: float, end: float) -> float:
     return ((end - start + 180.0) % 360.0) - 180.0
 
 
 def _line_with_db(magnitude_db: float) -> SpectralLine:
+    magnitude = 10 ** (magnitude_db / 20.0)
     return SpectralLine(
         view="test",
         order=0,
         freq_offset_ghz=0.0,
-        magnitude=10 ** (magnitude_db / 20.0),
+        magnitude=magnitude,
+        power=magnitude**2,
         magnitude_db=magnitude_db,
+        power_db=magnitude_db,
         phase_deg=0.0,
         real=1.0,
         imag=0.0,
