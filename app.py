@@ -34,6 +34,8 @@ ARROW_BASE_LENGTH_PX = 56.0
 HOVER_DISTANCE_PX = 18.0
 DISPLAY_MODE_OVERVIEW = "总览"
 DISPLAY_MODE_ARMS = "臂分解"
+MODEL_TYPE_IDEAL = "理想"
+MODEL_TYPE_NONIDEAL = "非理想"
 BIAS_INPUT_MODE_VOLTAGE = "偏压(V)"
 BIAS_INPUT_MODE_PHASE = "相位(deg)"
 PHASE_COLOR_MAP = LinearSegmentedColormap.from_list(
@@ -97,6 +99,47 @@ def arrow_display_delta_px(display_angle_deg: float, length_px: float) -> tuple[
     return length_px * math.cos(angle_rad), length_px * math.sin(angle_rad)
 
 
+def format_hover_text(line: SpectralLine) -> str:
+    """Return the compact hover text for one sideband."""
+
+    return (
+        f"频偏: {line.freq_offset_ghz:+.6g} GHz\n"
+        f"相位: {line.phase_deg:+.2f}°\n"
+        f"功率: {line.power:.6g} ({line.power_db:.2f} dB)"
+    )
+
+
+class CollapsibleSection(ttk.Frame):
+    """A small ttk-only section with a clickable expand/collapse header."""
+
+    def __init__(self, parent, title: str, *, expanded: bool = True) -> None:
+        super().__init__(parent)
+        self.title = title
+        self._expanded = tk.BooleanVar(value=expanded)
+        self.header = ttk.Button(self, command=self.toggle)
+        self.header.pack(fill="x")
+        self.content = ttk.Frame(self, padding=10, relief="groove", borderwidth=1)
+        self._sync_visibility()
+
+    def toggle(self) -> None:
+        self.set_expanded(not self._expanded.get())
+
+    def set_expanded(self, expanded: bool) -> None:
+        self._expanded.set(expanded)
+        self._sync_visibility()
+
+    def is_expanded(self) -> bool:
+        return self._expanded.get()
+
+    def _sync_visibility(self) -> None:
+        prefix = "▼" if self._expanded.get() else "▶"
+        self.header.configure(text=f"{prefix} {self.title}")
+        if self._expanded.get():
+            self.content.pack(fill="x", pady=(2, 0))
+        else:
+            self.content.pack_forget()
+
+
 class DPMZMSpectrumApp(tk.Tk):
     """Tkinter application that plots DPMZM spectra with vector sidebands."""
 
@@ -109,9 +152,14 @@ class DPMZMSpectrumApp(tk.Tk):
         self._update_job: str | None = None
         self.vars: dict[str, tk.StringVar] = {}
         self.display_mode_var = tk.StringVar(value=DISPLAY_MODE_OVERVIEW)
+        self.model_type_var = tk.StringVar(value=MODEL_TYPE_IDEAL)
         self.bias_input_mode_var = tk.StringVar(value=BIAS_INPUT_MODE_VOLTAGE)
         self._last_bias_input_mode = BIAS_INPUT_MODE_VOLTAGE
         self.bias_value_labels: dict[str, ttk.Label] = {}
+        self.nonideal_entries: list[ttk.Entry] = []
+        self.nonideal_section: CollapsibleSection | None = None
+        self.controls_outer: ttk.Frame | None = None
+        self.controls_canvas: tk.Canvas | None = None
         self.current_params = default_params()
         self.current_spectra = None
         self.hover_targets: list[dict[str, object]] = []
@@ -135,12 +183,44 @@ class DPMZMSpectrumApp(tk.Tk):
         self.columnconfigure(1, weight=1)
         self.rowconfigure(0, weight=1)
 
-        controls = ttk.Frame(self, padding=(12, 12, 8, 12))
-        controls.grid(row=0, column=0, sticky="ns")
+        controls_outer = ttk.Frame(self, padding=(12, 12, 8, 12))
+        controls_outer.grid(row=0, column=0, sticky="ns")
+        controls_outer.rowconfigure(0, weight=1)
+        controls_outer.columnconfigure(0, weight=1)
+        self.controls_outer = controls_outer
+
+        controls_canvas = tk.Canvas(
+            controls_outer,
+            width=320,
+            borderwidth=0,
+            highlightthickness=0,
+            background=self.cget("background"),
+        )
+        controls_scrollbar = ttk.Scrollbar(
+            controls_outer,
+            orient="vertical",
+            command=controls_canvas.yview,
+        )
+        controls_canvas.configure(yscrollcommand=controls_scrollbar.set)
+        controls_canvas.grid(row=0, column=0, sticky="ns")
+        controls_scrollbar.grid(row=0, column=1, sticky="ns")
+        controls = ttk.Frame(controls_canvas)
+        controls_window = controls_canvas.create_window((0, 0), window=controls, anchor="nw")
+        controls.bind(
+            "<Configure>",
+            lambda _event: controls_canvas.configure(scrollregion=controls_canvas.bbox("all")),
+        )
+        controls_canvas.bind(
+            "<Configure>",
+            lambda event: controls_canvas.itemconfigure(controls_window, width=event.width),
+        )
+        self.bind_all("<MouseWheel>", self._on_controls_mousewheel)
+        self.controls_canvas = controls_canvas
 
         self._add_display_controls(controls)
         self._add_bias_controls(controls)
         self._add_rf_controls(controls)
+        self._add_nonideal_controls(controls)
         self._add_action_buttons(controls)
 
         plot_area = ttk.Frame(self, padding=(4, 8, 12, 12))
@@ -165,8 +245,21 @@ class DPMZMSpectrumApp(tk.Tk):
         )
 
     def _add_display_controls(self, parent: ttk.Frame) -> None:
-        frame = ttk.LabelFrame(parent, text="显示模式", padding=10)
-        frame.pack(fill="x", pady=(0, 10))
+        section = CollapsibleSection(parent, "显示与模型", expanded=True)
+        section.pack(fill="x", pady=(0, 10))
+        frame = section.content
+        ttk.Label(frame, text="模型类型").grid(row=0, column=0, sticky="w", pady=3)
+        model_combo = ttk.Combobox(
+            frame,
+            textvariable=self.model_type_var,
+            values=(MODEL_TYPE_IDEAL, MODEL_TYPE_NONIDEAL),
+            state="readonly",
+            width=14,
+        )
+        model_combo.grid(row=0, column=1, sticky="ew", padx=(8, 0), pady=3)
+        model_combo.bind("<<ComboboxSelected>>", self._on_model_type_changed)
+
+        ttk.Label(frame, text="显示模式").grid(row=1, column=0, sticky="w", pady=3)
         combo = ttk.Combobox(
             frame,
             textvariable=self.display_mode_var,
@@ -174,12 +267,14 @@ class DPMZMSpectrumApp(tk.Tk):
             state="readonly",
             width=14,
         )
-        combo.pack(fill="x")
+        combo.grid(row=1, column=1, sticky="ew", padx=(8, 0), pady=3)
         combo.bind("<<ComboboxSelected>>", lambda _event: self._update_plot(show_error=True))
+        frame.columnconfigure(1, weight=1)
 
     def _add_bias_controls(self, parent: ttk.Frame) -> None:
-        frame = ttk.LabelFrame(parent, text="偏置输入与Vpi", padding=10)
-        frame.pack(fill="x", pady=(0, 10))
+        section = CollapsibleSection(parent, "偏置输入与Vpi", expanded=True)
+        section.pack(fill="x", pady=(0, 10))
+        frame = section.content
 
         ttk.Label(frame, text="输入方式").grid(row=0, column=0, sticky="w", pady=3)
         combo = ttk.Combobox(
@@ -224,8 +319,9 @@ class DPMZMSpectrumApp(tk.Tk):
         self._refresh_bias_labels()
 
     def _add_rf_controls(self, parent: ttk.Frame) -> None:
-        frame = ttk.LabelFrame(parent, text="单音RF与边带", padding=10)
-        frame.pack(fill="x", pady=(0, 10))
+        section = CollapsibleSection(parent, "单音RF与边带", expanded=True)
+        section.pack(fill="x", pady=(0, 10))
+        frame = section.content
         fields = [
             ("rf_frequency_ghz", "RF频率 (GHz)", self.current_params.rf_frequency_ghz),
             ("rf_amplitude_i_v", "I路RF峰值电压 (V)", self.current_params.rf_amplitude_i_v),
@@ -235,9 +331,33 @@ class DPMZMSpectrumApp(tk.Tk):
         ]
         self._add_entry_grid(frame, fields)
 
+    def _add_nonideal_controls(self, parent: ttk.Frame) -> None:
+        section = CollapsibleSection(parent, "非理想参数", expanded=False)
+        section.pack(fill="x", pady=(0, 10))
+        self.nonideal_section = section
+        frame = section.content
+        fields = [
+            ("extinction_ratio_i_db", "I路 ER (dB)", self.current_params.extinction_ratio_i_db),
+            ("extinction_ratio_q_db", "Q路 ER (dB)", self.current_params.extinction_ratio_q_db),
+            ("insertion_loss_i_db", "I路 IL (dB)", self.current_params.insertion_loss_i_db),
+            ("insertion_loss_q_db", "Q路 IL (dB)", self.current_params.insertion_loss_q_db),
+            ("insertion_loss_p_db", "P路 IL (dB)", self.current_params.insertion_loss_p_db),
+            ("insertion_loss_global_db", "全局 IL (dB)", self.current_params.insertion_loss_global_db),
+        ]
+        for row, (key, label, value) in enumerate(fields):
+            ttk.Label(frame, text=label).grid(row=row, column=0, sticky="w", pady=3)
+            var = tk.StringVar(value=self._format_default(value))
+            entry = ttk.Entry(frame, textvariable=var, width=16)
+            entry.grid(row=row, column=1, sticky="ew", padx=(8, 0), pady=3)
+            entry.bind("<Return>", lambda _event: self._update_plot(show_error=True))
+            self.vars[key] = var
+            self.nonideal_entries.append(entry)
+        frame.columnconfigure(1, weight=1)
+        self._refresh_nonideal_state()
+
     def _add_entry_grid(
         self,
-        parent: ttk.LabelFrame,
+        parent: ttk.Frame,
         fields: list[tuple[str, str, float | int]],
     ) -> None:
         for row, (key, label, value) in enumerate(fields):
@@ -262,7 +382,7 @@ class DPMZMSpectrumApp(tk.Tk):
 
         note = (
             "说明：I/Q子MZM按推挽建模；偏置可用电压或相位输入。"
-            "功率不再作为纵坐标，鼠标悬停到边带时显示。"
+            "点击分组标题可折叠参数区；鼠标悬停到边带时显示频偏、相位和功率。"
         )
         ttk.Label(parent, text=note, wraplength=245, foreground="#555").pack(
             fill="x",
@@ -281,6 +401,33 @@ class DPMZMSpectrumApp(tk.Tk):
     def _run_scheduled_update(self) -> None:
         self._update_job = None
         self._update_plot(show_error=False)
+
+    def _on_controls_mousewheel(self, event) -> None:
+        if self.controls_canvas is None or not self._event_is_inside_controls(event):
+            return
+        steps = int(-event.delta / 120)
+        if steps != 0:
+            self.controls_canvas.yview_scroll(steps, "units")
+
+    def _event_is_inside_controls(self, event) -> bool:
+        widget = event.widget
+        while widget is not None:
+            if widget is self.controls_outer:
+                return True
+            widget = getattr(widget, "master", None)
+        return False
+
+    def _on_model_type_changed(self, _event=None) -> None:
+        self._refresh_nonideal_state()
+        self._update_plot(show_error=True)
+
+    def _refresh_nonideal_state(self) -> None:
+        is_nonideal = self.model_type_var.get() == MODEL_TYPE_NONIDEAL
+        state = "normal" if is_nonideal else "disabled"
+        for entry in self.nonideal_entries:
+            entry.configure(state=state)
+        if is_nonideal and self.nonideal_section is not None:
+            self.nonideal_section.set_expanded(True)
 
     def _on_bias_input_mode_changed(self, _event=None) -> None:
         new_mode = self.bias_input_mode_var.get()
@@ -342,6 +489,10 @@ class DPMZMSpectrumApp(tk.Tk):
 
     def _reset_params(self) -> None:
         params = default_params()
+        self.model_type_var.set(MODEL_TYPE_IDEAL)
+        self._refresh_nonideal_state()
+        if self.nonideal_section is not None:
+            self.nonideal_section.set_expanded(False)
         self.bias_input_mode_var.set(BIAS_INPUT_MODE_VOLTAGE)
         self._last_bias_input_mode = BIAS_INPUT_MODE_VOLTAGE
         self._refresh_bias_labels()
@@ -357,13 +508,44 @@ class DPMZMSpectrumApp(tk.Tk):
             "rf_amplitude_q_v": params.rf_amplitude_q_v,
             "q_rf_phase_deg": params.q_rf_phase_deg,
             "sideband_order": params.sideband_order,
+            "extinction_ratio_i_db": params.extinction_ratio_i_db,
+            "extinction_ratio_q_db": params.extinction_ratio_q_db,
+            "insertion_loss_i_db": params.insertion_loss_i_db,
+            "insertion_loss_q_db": params.insertion_loss_q_db,
+            "insertion_loss_p_db": params.insertion_loss_p_db,
+            "insertion_loss_global_db": params.insertion_loss_global_db,
         }.items():
             self.vars[key].set(self._format_default(value))
         self._update_plot(show_error=True)
 
     def _parse_params(self) -> DPMZMParams:
-        values = {key: self._parse_float(key) for key in self.vars if key != "sideband_order"}
+        base_keys = (
+            "voltage_i",
+            "voltage_q",
+            "voltage_p",
+            "vpi_i",
+            "vpi_q",
+            "vpi_p",
+            "rf_frequency_ghz",
+            "rf_amplitude_i_v",
+            "rf_amplitude_q_v",
+            "q_rf_phase_deg",
+        )
+        values = {key: self._parse_float(key) for key in base_keys}
         sideband_order = self._parse_int("sideband_order")
+        use_nonideal = self.model_type_var.get() == MODEL_TYPE_NONIDEAL
+        nonideal_values = {}
+        if use_nonideal:
+            nonideal_keys = (
+                "extinction_ratio_i_db",
+                "extinction_ratio_q_db",
+                "insertion_loss_i_db",
+                "insertion_loss_q_db",
+                "insertion_loss_p_db",
+                "insertion_loss_global_db",
+            )
+            nonideal_values = {key: self._parse_float(key) for key in nonideal_keys}
+
         if self.bias_input_mode_var.get() == BIAS_INPUT_MODE_PHASE:
             voltage_i = phase_deg_to_voltage(values["voltage_i"], values["vpi_i"])
             voltage_q = phase_deg_to_voltage(values["voltage_q"], values["vpi_q"])
@@ -385,6 +567,8 @@ class DPMZMSpectrumApp(tk.Tk):
             rf_amplitude_q_v=values["rf_amplitude_q_v"],
             q_rf_phase_deg=values["q_rf_phase_deg"],
             sideband_order=sideband_order,
+            use_nonideal=use_nonideal,
+            **nonideal_values,
         )
 
     def _parse_float(self, key: str) -> float:
@@ -424,7 +608,7 @@ class DPMZMSpectrumApp(tk.Tk):
         self.current_params = params
         self.current_spectra = spectra
         self._draw_spectra(params, spectra, view_order)
-        self.status_var.set(f"已更新图像：{mode}")
+        self.status_var.set(f"已更新图像：{self.model_type_var.get()} / {mode}")
 
     def _draw_spectra(
         self,
@@ -604,16 +788,7 @@ class DPMZMSpectrumApp(tk.Tk):
                 self.canvas.draw_idle()
 
     def _format_hover_text(self, line: SpectralLine) -> str:
-        return (
-            f"{line.view}\n"
-            f"边带阶数: {line.order:+d}\n"
-            f"频偏: {line.freq_offset_ghz:+.6g} GHz\n"
-            f"真实相位: {line.phase_deg:+.2f}°\n"
-            f"场幅 |Ck|: {line.magnitude:.6g}\n"
-            f"光功率 |Ck|²: {line.power:.6g}\n"
-            f"相对功率: {line.power_db:.2f} dB\n"
-            f"复数: {line.real:+.6g} {line.imag:+.6g}j"
-        )
+        return format_hover_text(line)
 
     def _save_png(self) -> None:
         if not self._ensure_current_spectra():

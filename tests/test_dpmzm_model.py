@@ -16,10 +16,17 @@ from dpmzm_model import (
     SpectralLine,
     VIEW_COUPLED,
     VIEW_I,
+    VIEW_I_LOWER,
+    VIEW_I_TOTAL,
+    VIEW_I_UPPER,
     VIEW_ORDER,
+    VIEW_Q,
     VIEW_Q_AFTER_P,
     child_mzm_coefficients,
     child_mzm_components,
+    child_mzm_components_nonideal,
+    extinction_ratio_delta,
+    field_loss_factor,
     phase_to_display_angle_deg,
     simulate_arm_spectra,
     simulate_spectra,
@@ -28,6 +35,7 @@ from dpmzm_model import (
 from app import (
     ARROW_BASE_LENGTH_PX,
     arrow_display_delta_px,
+    format_hover_text,
     is_visible_sideband,
     phase_deg_to_voltage,
     phase_to_color,
@@ -262,6 +270,166 @@ class DPMZMModelTests(unittest.TestCase):
                 places=12,
             )
 
+    def test_ideal_model_ignores_nonideal_parameter_values(self) -> None:
+        base = DPMZMParams(voltage_i=0.8, voltage_q=-0.3, voltage_p=1.2, sideband_order=3)
+        disabled_nonideal = DPMZMParams(
+            voltage_i=0.8,
+            voltage_q=-0.3,
+            voltage_p=1.2,
+            sideband_order=3,
+            use_nonideal=False,
+            extinction_ratio_i_db=5.0,
+            extinction_ratio_q_db=8.0,
+            insertion_loss_i_db=11.0,
+            insertion_loss_q_db=12.0,
+            insertion_loss_p_db=13.0,
+            insertion_loss_global_db=14.0,
+        )
+
+        base_spectra = simulate_spectra(base)
+        disabled_spectra = simulate_spectra(disabled_nonideal)
+
+        for view in VIEW_ORDER:
+            for base_line, disabled_line in zip(base_spectra[view], disabled_spectra[view]):
+                self.assertEqual(base_line.order, disabled_line.order)
+                self.assertAlmostEqual(base_line.real, disabled_line.real, places=12)
+                self.assertAlmostEqual(base_line.imag, disabled_line.imag, places=12)
+
+    def test_nonideal_with_no_loss_and_high_er_approaches_ideal(self) -> None:
+        ideal = DPMZMParams(voltage_i=0.8, voltage_q=-0.3, voltage_p=1.2, sideband_order=3)
+        nearly_ideal = DPMZMParams(
+            voltage_i=0.8,
+            voltage_q=-0.3,
+            voltage_p=1.2,
+            sideband_order=3,
+            use_nonideal=True,
+            extinction_ratio_i_db=120.0,
+            extinction_ratio_q_db=120.0,
+            insertion_loss_i_db=0.0,
+            insertion_loss_q_db=0.0,
+            insertion_loss_p_db=0.0,
+            insertion_loss_global_db=0.0,
+        )
+
+        ideal_spectra = simulate_spectra(ideal)
+        nearly_ideal_spectra = simulate_spectra(nearly_ideal)
+
+        for view in VIEW_ORDER:
+            for ideal_line, nonideal_line in zip(ideal_spectra[view], nearly_ideal_spectra[view]):
+                self.assertEqual(ideal_line.order, nonideal_line.order)
+                self.assertAlmostEqual(ideal_line.real, nonideal_line.real, places=5)
+                self.assertAlmostEqual(ideal_line.imag, nonideal_line.imag, places=5)
+
+    def test_nonideal_helpers_match_vpi_er_and_loss_definitions(self) -> None:
+        self.assertAlmostEqual(field_loss_factor(6.0), 10 ** (-6.0 / 20.0))
+        self.assertAlmostEqual(extinction_ratio_delta(30.0), 1.0 / (10 ** (30.0 / 20.0) - 1.0))
+
+    def test_nonideal_child_max_transmission_field_equals_sqrt_loss(self) -> None:
+        loss_db = 6.0
+        components = child_mzm_components_nonideal(
+            bias_voltage=0.0,
+            vpi=5.0,
+            rf_peak_voltage=0.0,
+            sideband_order=0,
+            insertion_loss_db=loss_db,
+            extinction_ratio_db=30.0,
+        )
+
+        self.assertAlmostEqual(abs(components.total[0]), field_loss_factor(loss_db), places=12)
+
+    def test_nonideal_child_null_residual_matches_extinction_ratio(self) -> None:
+        loss_db = 6.0
+        er_db = 30.0
+        components = child_mzm_components_nonideal(
+            bias_voltage=5.0,
+            vpi=5.0,
+            rf_peak_voltage=0.0,
+            sideband_order=0,
+            insertion_loss_db=loss_db,
+            extinction_ratio_db=er_db,
+        )
+
+        expected = field_loss_factor(loss_db) * 10 ** (-er_db / 20.0)
+        self.assertAlmostEqual(abs(components.total[0]), expected, places=12)
+
+    def test_nonideal_p_loss_scales_only_q_after_p_view(self) -> None:
+        common = {
+            "use_nonideal": True,
+            "voltage_i": 0.8,
+            "voltage_q": -0.3,
+            "voltage_p": 1.2,
+            "sideband_order": 3,
+            "extinction_ratio_i_db": 120.0,
+            "extinction_ratio_q_db": 120.0,
+            "insertion_loss_i_db": 0.0,
+            "insertion_loss_q_db": 0.0,
+            "insertion_loss_global_db": 0.0,
+        }
+        no_p_loss = simulate_spectra(DPMZMParams(**common, insertion_loss_p_db=0.0))
+        with_p_loss = simulate_spectra(DPMZMParams(**common, insertion_loss_p_db=6.0))
+        p_factor = field_loss_factor(6.0)
+
+        for no_loss_q, with_loss_q in zip(no_p_loss[VIEW_Q], with_p_loss[VIEW_Q]):
+            self.assertEqual(no_loss_q.order, with_loss_q.order)
+            self.assertAlmostEqual(no_loss_q.real, with_loss_q.real, places=12)
+            self.assertAlmostEqual(no_loss_q.imag, with_loss_q.imag, places=12)
+
+        for no_loss_qp, with_loss_qp in zip(no_p_loss[VIEW_Q_AFTER_P], with_p_loss[VIEW_Q_AFTER_P]):
+            self.assertEqual(no_loss_qp.order, with_loss_qp.order)
+            expected = complex(no_loss_qp.real, no_loss_qp.imag) * p_factor
+            actual = complex(with_loss_qp.real, with_loss_qp.imag)
+            self.assertAlmostEqual(actual.real, expected.real, places=12)
+            self.assertAlmostEqual(actual.imag, expected.imag, places=12)
+
+    def test_nonideal_arm_spectra_components_sum_to_total(self) -> None:
+        params = DPMZMParams(
+            use_nonideal=True,
+            voltage_i=0.8,
+            voltage_q=-0.3,
+            sideband_order=3,
+        )
+        spectra = simulate_arm_spectra(params)
+        upper_by_order = {line.order: line for line in spectra[VIEW_I_UPPER]}
+        lower_by_order = {line.order: line for line in spectra[VIEW_I_LOWER]}
+        total_by_order = {line.order: line for line in spectra[VIEW_I_TOTAL]}
+
+        for order, total_line in total_by_order.items():
+            expected = (
+                complex(upper_by_order[order].real, upper_by_order[order].imag)
+                + complex(lower_by_order[order].real, lower_by_order[order].imag)
+            )
+            actual = complex(total_line.real, total_line.imag)
+            self.assertAlmostEqual(actual.real, expected.real, places=12)
+            self.assertAlmostEqual(actual.imag, expected.imag, places=12)
+
+    def test_nonideal_coupled_output_matches_complex_field_sum_with_global_loss(self) -> None:
+        params = DPMZMParams(
+            use_nonideal=True,
+            voltage_i=0.8,
+            voltage_q=-0.3,
+            voltage_p=1.2,
+            insertion_loss_global_db=3.0,
+            sideband_order=3,
+        )
+        spectra = simulate_spectra(params)
+        i_by_order = {line.order: line for line in spectra[VIEW_I]}
+        q_after_p_by_order = {line.order: line for line in spectra[VIEW_Q_AFTER_P]}
+        coupled_by_order = {line.order: line for line in spectra[VIEW_COUPLED]}
+        global_factor = field_loss_factor(params.insertion_loss_global_db)
+
+        for order, coupled_line in coupled_by_order.items():
+            expected = (
+                global_factor
+                * (
+                    complex(i_by_order[order].real, i_by_order[order].imag)
+                    + complex(q_after_p_by_order[order].real, q_after_p_by_order[order].imag)
+                )
+                / math.sqrt(2.0)
+            )
+            actual = complex(coupled_line.real, coupled_line.imag)
+            self.assertAlmostEqual(actual.real, expected.real, places=12)
+            self.assertAlmostEqual(actual.imag, expected.imag, places=12)
+
     def test_bias_voltage_phase_conversion_helpers(self) -> None:
         self.assertAlmostEqual(voltage_to_phase_deg(3.0, 5.0), 108.0)
         self.assertAlmostEqual(phase_deg_to_voltage(108.0, 5.0), 3.0)
@@ -343,6 +511,18 @@ class DPMZMModelTests(unittest.TestCase):
 
         for negative_component, positive_component in zip(negative, positive):
             self.assertAlmostEqual(negative_component, positive_component, places=12)
+
+    def test_hover_text_shows_only_frequency_phase_and_power(self) -> None:
+        text = format_hover_text(_line_with_db(-20.0))
+
+        self.assertEqual(len(text.splitlines()), 3)
+        self.assertIn("频偏", text)
+        self.assertIn("相位", text)
+        self.assertIn("功率", text)
+        self.assertIn("dB", text)
+        self.assertNotIn("场幅", text)
+        self.assertNotIn("复数", text)
+        self.assertNotIn("边带阶数", text)
 
     def test_csv_export_contains_all_views_orders_and_true_phase_only(self) -> None:
         params = DPMZMParams(sideband_order=2)

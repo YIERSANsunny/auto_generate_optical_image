@@ -40,6 +40,9 @@ ALL_VIEW_ORDER = VIEW_ORDER + ARM_VIEW_ORDER
 
 PUSH_PULL_ARM_RF_PHASE_DIFF_DEG = 180.0
 SPECIAL_DISPLAY_ANGLE_TOLERANCE_DEG = 1.0
+DEFAULT_EXTINCTION_RATIO_DB = 30.0
+DEFAULT_CHILD_INSERTION_LOSS_DB = 6.0
+DEFAULT_GLOBAL_INSERTION_LOSS_DB = 0.0
 
 
 @dataclass(frozen=True)
@@ -57,6 +60,13 @@ class DPMZMParams:
     rf_amplitude_q_v: float = 0.4
     q_rf_phase_deg: float = 0.0
     sideband_order: int = 5
+    use_nonideal: bool = False
+    extinction_ratio_i_db: float = DEFAULT_EXTINCTION_RATIO_DB
+    extinction_ratio_q_db: float = DEFAULT_EXTINCTION_RATIO_DB
+    insertion_loss_i_db: float = DEFAULT_CHILD_INSERTION_LOSS_DB
+    insertion_loss_q_db: float = DEFAULT_CHILD_INSERTION_LOSS_DB
+    insertion_loss_p_db: float = DEFAULT_CHILD_INSERTION_LOSS_DB
+    insertion_loss_global_db: float = DEFAULT_GLOBAL_INSERTION_LOSS_DB
 
 
 @dataclass(frozen=True)
@@ -176,36 +186,95 @@ def child_mzm_coefficients(
     ).total
 
 
+def field_loss_factor(insertion_loss_db: float) -> float:
+    """Return the complex-field attenuation for a power insertion loss in dB."""
+
+    if insertion_loss_db < 0.0:
+        raise ValueError("插入损耗不能为负。")
+    return 10.0 ** (-insertion_loss_db / 20.0)
+
+
+def extinction_ratio_delta(extinction_ratio_db: float) -> float:
+    """Return the finite-extinction residual coefficient for the VPI ER model."""
+
+    denominator = 10.0 ** (extinction_ratio_db / 20.0) - 1.0
+    if denominator <= 0.0:
+        raise ValueError("消光比必须大于0 dB。")
+    return 1.0 / denominator
+
+
+def child_mzm_components_nonideal(
+    *,
+    bias_voltage: float,
+    vpi: float,
+    rf_peak_voltage: float,
+    sideband_order: int,
+    rf_relative_phase_deg: float = 0.0,
+    insertion_loss_db: float = DEFAULT_CHILD_INSERTION_LOSS_DB,
+    extinction_ratio_db: float = DEFAULT_EXTINCTION_RATIO_DB,
+    arm_rf_phase_diff_deg: float = PUSH_PULL_ARM_RF_PHASE_DIFF_DEG,
+) -> ChildMZMComponents:
+    """Return VPI-style finite-ER child MZM sideband coefficients.
+
+    The ideal push-pull child MZM is first expanded into upper/lower arm
+    coefficients. Finite extinction ratio adds a residual upper-arm-like field:
+        H = sqrt(L) * [cos(phi/2) + delta * exp(j phi/2)] / (1 + delta).
+    Since the stored upper arm already includes the 0.5 splitter factor,
+    exp(j phi/2) contributes as 2 * upper.
+    """
+
+    ideal = child_mzm_components(
+        bias_voltage=bias_voltage,
+        vpi=vpi,
+        rf_peak_voltage=rf_peak_voltage,
+        sideband_order=sideband_order,
+        rf_relative_phase_deg=rf_relative_phase_deg,
+        arm_rf_phase_diff_deg=arm_rf_phase_diff_deg,
+    )
+    loss = field_loss_factor(insertion_loss_db)
+    residual = extinction_ratio_delta(extinction_ratio_db)
+    scale = loss / (1.0 + residual)
+
+    upper = {
+        order: complex(scale * (1.0 + 2.0 * residual) * ideal.upper[order])
+        for order in _orders(sideband_order)
+    }
+    lower = {
+        order: complex(scale * ideal.lower[order])
+        for order in _orders(sideband_order)
+    }
+    total = {
+        order: complex(upper[order] + lower[order])
+        for order in _orders(sideband_order)
+    }
+    return ChildMZMComponents(upper=upper, lower=lower, total=total)
+
+
 def simulate_spectra(params: DPMZMParams) -> dict[str, list[SpectralLine]]:
     """Simulate I, Q, Q-after-P, and coherently coupled DPMZM spectra."""
 
     _validate_params(params)
 
-    i_components = child_mzm_components(
-        bias_voltage=params.voltage_i,
-        vpi=params.vpi_i,
-        rf_peak_voltage=params.rf_amplitude_i_v,
-        sideband_order=params.sideband_order,
-        rf_relative_phase_deg=0.0,
-    )
-    q_components = child_mzm_components(
-        bias_voltage=params.voltage_q,
-        vpi=params.vpi_q,
-        rf_peak_voltage=params.rf_amplitude_q_v,
-        sideband_order=params.sideband_order,
-        rf_relative_phase_deg=params.q_rf_phase_deg,
-    )
+    i_components, q_components = _child_components_for_params(params)
     i_coeffs = i_components.total
     q_coeffs = q_components.total
     phi_p = math.pi * params.voltage_p / params.vpi_p
-    p_phase = np.exp(1j * phi_p)
+    p_factor = np.exp(1j * phi_p)
+    global_factor = 1.0
+    if params.use_nonideal:
+        p_factor *= field_loss_factor(params.insertion_loss_p_db)
+        global_factor = field_loss_factor(params.insertion_loss_global_db)
 
     q_after_p_coeffs = {
-        order: complex(p_phase * q_coeffs[order])
+        order: complex(p_factor * q_coeffs[order])
         for order in _orders(params.sideband_order)
     }
     coupled_coeffs = {
-        order: complex((i_coeffs[order] + q_after_p_coeffs[order]) / math.sqrt(2.0))
+        order: complex(
+            global_factor
+            * (i_coeffs[order] + q_after_p_coeffs[order])
+            / math.sqrt(2.0)
+        )
         for order in _orders(params.sideband_order)
     }
 
@@ -224,20 +293,7 @@ def simulate_arm_spectra(params: DPMZMParams) -> dict[str, list[SpectralLine]]:
 
     _validate_params(params)
 
-    i_components = child_mzm_components(
-        bias_voltage=params.voltage_i,
-        vpi=params.vpi_i,
-        rf_peak_voltage=params.rf_amplitude_i_v,
-        sideband_order=params.sideband_order,
-        rf_relative_phase_deg=0.0,
-    )
-    q_components = child_mzm_components(
-        bias_voltage=params.voltage_q,
-        vpi=params.vpi_q,
-        rf_peak_voltage=params.rf_amplitude_q_v,
-        sideband_order=params.sideband_order,
-        rf_relative_phase_deg=params.q_rf_phase_deg,
-    )
+    i_components, q_components = _child_components_for_params(params)
     raw = {
         VIEW_I_UPPER: i_components.upper,
         VIEW_I_LOWER: i_components.lower,
@@ -247,6 +303,46 @@ def simulate_arm_spectra(params: DPMZMParams) -> dict[str, list[SpectralLine]]:
         VIEW_Q_TOTAL: q_components.total,
     }
     return _coeff_sets_to_spectra(raw, ARM_VIEW_ORDER, params)
+
+
+def _child_components_for_params(params: DPMZMParams) -> tuple[ChildMZMComponents, ChildMZMComponents]:
+    if params.use_nonideal:
+        return (
+            child_mzm_components_nonideal(
+                bias_voltage=params.voltage_i,
+                vpi=params.vpi_i,
+                rf_peak_voltage=params.rf_amplitude_i_v,
+                sideband_order=params.sideband_order,
+                rf_relative_phase_deg=0.0,
+                insertion_loss_db=params.insertion_loss_i_db,
+                extinction_ratio_db=params.extinction_ratio_i_db,
+            ),
+            child_mzm_components_nonideal(
+                bias_voltage=params.voltage_q,
+                vpi=params.vpi_q,
+                rf_peak_voltage=params.rf_amplitude_q_v,
+                sideband_order=params.sideband_order,
+                rf_relative_phase_deg=params.q_rf_phase_deg,
+                insertion_loss_db=params.insertion_loss_q_db,
+                extinction_ratio_db=params.extinction_ratio_q_db,
+            ),
+        )
+    return (
+        child_mzm_components(
+            bias_voltage=params.voltage_i,
+            vpi=params.vpi_i,
+            rf_peak_voltage=params.rf_amplitude_i_v,
+            sideband_order=params.sideband_order,
+            rf_relative_phase_deg=0.0,
+        ),
+        child_mzm_components(
+            bias_voltage=params.voltage_q,
+            vpi=params.vpi_q,
+            rf_peak_voltage=params.rf_amplitude_q_v,
+            sideband_order=params.sideband_order,
+            rf_relative_phase_deg=params.q_rf_phase_deg,
+        ),
+    )
 
 
 def _coeff_sets_to_spectra(
@@ -392,3 +488,14 @@ def _validate_params(params: DPMZMParams) -> None:
         raise ValueError("RF峰值电压不能为负。")
     if params.sideband_order < 0:
         raise ValueError("边带阶数不能为负。")
+    if params.use_nonideal:
+        if params.extinction_ratio_i_db <= 0.0 or params.extinction_ratio_q_db <= 0.0:
+            raise ValueError("消光比必须大于0 dB。")
+        insertion_losses = (
+            params.insertion_loss_i_db,
+            params.insertion_loss_q_db,
+            params.insertion_loss_p_db,
+            params.insertion_loss_global_db,
+        )
+        if any(value < 0.0 for value in insertion_losses):
+            raise ValueError("插入损耗不能为负。")

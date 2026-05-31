@@ -14,6 +14,8 @@
 - 相对光功率 `|Ck|^2`。
 - 真实物理相位 `phase_deg`。
 - I/Q 子 MZM 上下臂贡献和合成结果。
+- 可切换的理想/非理想光谱模型。
+- 非理想模型中的插入损耗和有限消光比。
 - Q 路经过 P 路后的相位旋转。
 - I 路与 Q 路经过 P 路后的相干耦合。
 
@@ -21,11 +23,11 @@
 
 - 绝对光功率标定。
 - 光载频绝对值。
-- 插入损耗、消光比、噪声、偏振、带宽滚降。
+- 噪声、偏振、带宽滚降。
 - RF 任意波形导入。
-- 器件非理想、臂不平衡、耦合器非 3 dB 分光等实验误差项。
+- 臂不平衡、耦合器非 3 dB 分光等更复杂实验误差项。
 
-当前版本默认使用单音 RF 和理想推挽子 MZM。
+当前版本默认使用单音 RF 和理想推挽子 MZM；非理想模型作为可选光谱域近似模型启用。
 
 ## 2. 坐标与符号约定
 
@@ -75,6 +77,13 @@ rf_amplitude_i_v    I 路 RF 峰值电压
 rf_amplitude_q_v    Q 路 RF 峰值电压
 q_rf_phase_deg      Q 路 RF 相对 I 路的时间相位 psi
 sideband_order      计算边带阶数 N，输出 k=-N...+N
+use_nonideal        是否启用非理想光谱模型
+extinction_ratio_i_db  I 路子 MZM 消光比
+extinction_ratio_q_db  Q 路子 MZM 消光比
+insertion_loss_i_db    I 路子 MZM 插入损耗
+insertion_loss_q_db    Q 路子 MZM 插入损耗
+insertion_loss_p_db    P 路公共相位块插入损耗，只作用于 Q 路
+insertion_loss_global_db 最终耦合输出后的公共插入损耗
 ```
 
 当前默认值：
@@ -88,6 +97,10 @@ rf_frequency_ghz = 10 GHz
 rf_amplitude_i_v = rf_amplitude_q_v = 0.4 V
 q_rf_phase_deg = 0 deg
 sideband_order = 5
+use_nonideal = False
+extinction_ratio_i_db = extinction_ratio_q_db = 30 dB
+insertion_loss_i_db = insertion_loss_q_db = insertion_loss_p_db = 6 dB
+insertion_loss_global_db = 0 dB
 ```
 
 GUI 支持用相位直接设置静态偏置。相位输入和偏压输入完全等价，模型内部仍然使用等效电压：
@@ -254,7 +267,66 @@ Out[k] = (I[k] + Q_after_P[k]) / sqrt(2)
 - 耦合使用复数场，不使用 `magnitude`、`power` 或 dB。
 - 耦合后的相位由 `atan2(imag, real)` 得到。
 
-## 8. 场幅、功率与 dB
+## 8. 非理想光谱模型
+
+`use_nonideal = False` 时，模型严格使用前面的理想贝塞尔边带系数，非理想参数不参与计算。
+
+`use_nonideal = True` 时，I/Q 子 MZM 采用 VPI 对齐的有限消光比和插入损耗形式。插入损耗是功率损耗，进入复数光场时取平方根：
+
+```text
+L = 10^(-IL_dB/10)
+sqrt(L) = 10^(-IL_dB/20)
+```
+
+有限消光比残余项：
+
+```text
+delta_er = 1 / (10^(ER_dB/20) - 1)
+```
+
+I/Q 子 MZM 的 NEGATIVE 推挽传输写成：
+
+```text
+H_neg = sqrt(L) * [cos(phi/2) + delta_er * exp(j*phi/2)] / (1 + delta_er)
+```
+
+在当前贝塞尔边带系数中，理想 `upper[k]` 已经包含 `0.5` 系数，所以 `exp(j*phi/2)` 对应 `2 * upper_ideal[k]`。因此：
+
+```text
+total_nonideal[k] =
+    sqrt(L)/(1+delta_er) * (total_ideal[k] + 2*delta_er*upper_ideal[k])
+```
+
+臂分解中把有限消光比残余项归入上臂显示，以保持可视化中的相干相加关系：
+
+```text
+upper_nonideal[k] = sqrt(L)/(1+delta_er) * (1+2*delta_er) * upper_ideal[k]
+lower_nonideal[k] = sqrt(L)/(1+delta_er) * lower_ideal[k]
+total_nonideal[k] = upper_nonideal[k] + lower_nonideal[k]
+```
+
+这个 VPI 对齐形式满足两个边界：
+
+```text
+phi = 0     -> |H_neg| = sqrt(L)
+phi = pi    -> |H_neg| = sqrt(L) * 10^(-ER_dB/20)
+```
+
+P 路按 POSITIVE 公共相位块处理，位于 Q 光路上：
+
+```text
+Q_after_P[k] = sqrt(L_P) * exp(j*phiP) * Q[k]
+```
+
+最终耦合输出在非理想模式下加入公共输出损耗：
+
+```text
+Out[k] = sqrt(L_global) * (I[k] + Q_after_P[k]) / sqrt(2)
+```
+
+注意：`insertion_loss_global_db` 只作用于 `耦合输出`，不反向缩放 I/Q 中间视图。
+
+## 9. 场幅、功率与 dB
 
 模型对每个复数系数 `Ck` 计算：
 
@@ -295,7 +367,7 @@ if magnitude <= 1e-15: magnitude_db = -300
 if power <= 1e-30: power_db = -300
 ```
 
-## 9. 输出数据结构
+## 10. 输出数据结构
 
 `SpectralLine` 表示一条谱线：
 
@@ -320,7 +392,7 @@ view, order, freq_offset_ghz, magnitude, power, magnitude_db, power_db, phase_de
 
 CSV 只导出真实物理相位 `phase_deg`，不导出视觉箭头角度。
 
-## 10. 可视化规则
+## 11. 可视化规则
 
 图面不把功率作为纵坐标。每个可见边带从横轴 `y=0` 出发画一个相位箭头。
 
@@ -349,7 +421,7 @@ normalized_magnitude = 10^(magnitude_db / 20)
 length_px = ARROW_BASE_LENGTH_PX * (0.75 + 0.25 * normalized_magnitude)
 ```
 
-箭头长度不是严格功率坐标。精确数值以 hover 和 CSV 为准。
+箭头长度不是严格功率坐标。鼠标悬停只显示三项核心信息：频偏、真实相位、相对光功率 `|Ck|^2` 与相对功率 dB。完整场幅、功率、复数实部/虚部以 CSV 为准。
 
 相位颜色使用高对比循环色图：
 
@@ -370,7 +442,7 @@ PHASE_LABEL_DB_THRESHOLD = -60 dB
 
 低于阈值的边带不画箭头、不标相位、不进入 hover 目标，避免近零边带的随机相位误导。
 
-## 11. 验证方法
+## 12. 验证方法
 
 当前测试覆盖以下物理一致性。
 
@@ -421,6 +493,17 @@ power == real^2 + imag^2 == magnitude^2
 power_db == 10 * log10(power / max_power)
 ```
 
+非理想模型：
+
+```text
+use_nonideal = False 时输出与理想模型完全一致。
+IL=0 且 ER 很大时，非理想模型近似理想模型。
+bias=0, RF=0 时，子 MZM 场幅为 sqrt(L)。
+bias=Vpi, RF=0 时，子 MZM 残余场幅为 sqrt(L)*10^(-ER/20)。
+P 路插损只缩放 Q_after_P 和最终耦合中的 Q 分量。
+非理想臂分解仍满足 upper + lower = total。
+```
+
 偏压/相位输入等价：
 
 ```text
@@ -429,14 +512,12 @@ phase_deg = 180 * Vbias / Vpi
 
 用相位输入换算得到的等效偏压，与直接输入偏压得到的光谱一致。
 
-## 12. 实现边界与后续扩展
+## 13. 实现边界与后续扩展
 
-当前模型是理想、相对、单音 RF 模型。若后续要贴近实验，需要单独引入并标定：
+当前模型是相对、单音 RF 光谱模型。非理想模式已经包含 I/Q 子 MZM 插入损耗、有限消光比和 P 路插入损耗，但仍不是完整实验链路。若后续要贴近实验，需要单独引入并标定：
 
 - 输入光功率和绝对功率单位。
 - 耦合器真实分光比。
-- I/Q/P 插损。
-- 子 MZM 消光比。
 - 上下臂幅度不平衡。
 - RF 幅频响应。
 - 光电探测器响应。
