@@ -10,9 +10,9 @@ import matplotlib
 
 matplotlib.use("TkAgg")
 
-from matplotlib import colormaps
+from matplotlib import patheffects
 from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg, NavigationToolbar2Tk
-from matplotlib.colors import Normalize
+from matplotlib.colors import LinearSegmentedColormap, Normalize
 from matplotlib.figure import Figure
 from matplotlib.transforms import offset_copy
 
@@ -36,6 +36,24 @@ DISPLAY_MODE_OVERVIEW = "总览"
 DISPLAY_MODE_ARMS = "臂分解"
 BIAS_INPUT_MODE_VOLTAGE = "偏压(V)"
 BIAS_INPUT_MODE_PHASE = "相位(deg)"
+PHASE_COLOR_MAP = LinearSegmentedColormap.from_list(
+    "dpmzm_high_contrast_phase",
+    [
+        (0.0, "#8b1e5b"),
+        (0.25, "#2563eb"),
+        (0.5, "#065f46"),
+        (0.75, "#f97316"),
+        (1.0, "#8b1e5b"),
+    ],
+)
+PHASE_COLOR_NORM = Normalize(vmin=-180.0, vmax=180.0)
+
+
+def phase_to_color(phase_deg: float) -> tuple[float, float, float, float]:
+    """Return a high-contrast display color for a true optical phase."""
+
+    wrapped_phase = ((phase_deg + 180.0) % 360.0) - 180.0
+    return PHASE_COLOR_MAP(PHASE_COLOR_NORM(wrapped_phase))
 
 
 def voltage_to_phase_deg(voltage: float, vpi: float) -> float:
@@ -417,8 +435,6 @@ class DPMZMSpectrumApp(tk.Tk):
         self.figure.clear()
         columns = 3 if view_order == ARM_VIEW_ORDER else 2
         axes = self.figure.subplots(2, columns, sharex=True, sharey=True, squeeze=False).ravel()
-        cmap = colormaps["twilight_shifted"]
-        norm = Normalize(vmin=-180.0, vmax=180.0)
         self.hover_targets = []
         self.hover_annotation = None
 
@@ -443,12 +459,15 @@ class DPMZMSpectrumApp(tk.Tk):
             for line in spectra[view]:
                 if not is_visible_sideband(line):
                     continue
-                color = cmap(norm(line.phase_deg))
+                color = phase_to_color(line.phase_deg)
                 self._draw_phase_arrow(axis, line, color)
 
         axes[-1].set_xlabel(f"边带阶数 k，频偏 = k × {params.rf_frequency_ghz:g} GHz")
 
-        scalar_mappable = matplotlib.cm.ScalarMappable(norm=norm, cmap=cmap)
+        scalar_mappable = matplotlib.cm.ScalarMappable(
+            norm=PHASE_COLOR_NORM,
+            cmap=PHASE_COLOR_MAP,
+        )
         scalar_mappable.set_array([])
         colorbar = self.figure.colorbar(
             scalar_mappable,
@@ -507,6 +526,7 @@ class DPMZMSpectrumApp(tk.Tk):
             va="bottom" if dy_px >= 0.0 else "top",
             fontsize=10,
             color=color,
+            path_effects=[patheffects.withStroke(linewidth=2.6, foreground="white")],
             zorder=5,
         )
         self.hover_targets.append(

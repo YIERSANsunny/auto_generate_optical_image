@@ -30,6 +30,7 @@ from app import (
     arrow_display_delta_px,
     is_visible_sideband,
     phase_deg_to_voltage,
+    phase_to_color,
     vector_arrow_length_px,
     voltage_to_phase_deg,
 )
@@ -328,6 +329,21 @@ class DPMZMModelTests(unittest.TestCase):
         self.assertEqual(phase_to_display_angle_deg(45.0), 45.0)
         self.assertEqual(phase_to_display_angle_deg(-45.0), -45.0)
 
+    def test_phase_color_zero_is_high_contrast_not_white(self) -> None:
+        red, green, blue, _alpha = phase_to_color(0.0)
+
+        self.assertLess(_relative_luminance(red, green, blue), 0.35)
+        self.assertFalse(red > 0.85 and green > 0.85 and blue > 0.85)
+        self.assertGreater(green, red)
+        self.assertGreater(green, blue)
+
+    def test_phase_color_wraps_at_plus_minus_180(self) -> None:
+        negative = phase_to_color(-180.0)
+        positive = phase_to_color(180.0)
+
+        for negative_component, positive_component in zip(negative, positive):
+            self.assertAlmostEqual(negative_component, positive_component, places=12)
+
     def test_csv_export_contains_all_views_orders_and_true_phase_only(self) -> None:
         params = DPMZMParams(sideband_order=2)
         spectra = simulate_spectra(params)
@@ -502,6 +518,10 @@ def _sampled_child_mzm_components(
 
 def _phase_delta_deg(start: float, end: float) -> float:
     return ((end - start + 180.0) % 360.0) - 180.0
+
+
+def _relative_luminance(red: float, green: float, blue: float) -> float:
+    return 0.2126 * red + 0.7152 * green + 0.0722 * blue
 
 
 def _line_with_db(magnitude_db: float) -> SpectralLine:
